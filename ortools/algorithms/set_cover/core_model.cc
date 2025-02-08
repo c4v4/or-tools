@@ -14,6 +14,31 @@
 #include "core_model.h"
 namespace operations_research::scp {
 
+namespace {
+
+// TODO(c4v4): implement the initial tentative core model from [1]
+void BuildFirstCoreModel(const Model& full_model, Model& core_model) {
+  // 1. Clear core_model from previoys data
+  // 2. Clear core->full mappings
+
+  // 3. Select the first n columns of each row (there might be duplicates)
+  // 4. Sort the column list to detect duplicates
+
+  // 5. Add columns to core model
+  // 6. Create core->full mappings
+  // 7. Fill core_model RowView
+
+  // Stub
+  core_model = full_model;
+}
+
+}  // namespace
+
+CoreFromFullModel::CoreFromFullModel(Model* full_model)
+    : full_model_(full_model) {
+  BuildFirstCoreModel(*full_model_, this->GetCoreModel());
+}
+
 // TODO(c4v4): implement the pricing + column selection + mappings
 std::tuple<Cost, bool> CoreFromFullModel::UpdateModelAndLowerBound(
     ElementCostVector& multipliers, Cost lower_bound, Cost upper_bound) {

@@ -47,6 +47,9 @@ using Model = SetCoverModel;
 // TODO(c4v4): provided an example of column generation.
 class CoreModel {
  public:
+  CoreModel() = default;
+  CoreModel(const Model& core_model) : core_model_(core_model) {}
+  CoreModel(Model&& core_model) : core_model_(std::move(core_model)) {}
   virtual ~CoreModel() = default;
 
   Model& GetCoreModel() { return core_model_; }
@@ -63,6 +66,9 @@ class CoreModel {
 // The full model is the core model.
 class IdentityModel final : public CoreModel {
  public:
+  template <typename... Args>
+  IdentityModel(Args&&... args) : CoreModel(std::forward<Args>(args)...) {}
+
   std::tuple<Cost, bool> UpdateModelAndLowerBound(
       ElementCostVector& multipliers, Cost lower_bound,
       Cost upper_bound) override {
@@ -78,7 +84,17 @@ class IdentityModel final : public CoreModel {
 // https://www.jstor.org/stable/223097
 class CoreFromFullModel final : public CoreModel {
  public:
-  CoreFromFullModel(Model* full_model) : full_model_(full_model) {}
+  // The core model is automatically constructed as in [1]
+  CoreFromFullModel(Model* full_model);
+
+  // Externally provided initial core model
+  CoreFromFullModel(const Model& core_model, Model* full_model)
+      : CoreModel(core_model), full_model_(full_model) {}
+  CoreFromFullModel(Model&& core_model, Model* full_model)
+      : CoreModel(std::move(core_model)), full_model_(full_model) {}
+
+  Model& GetFullModel() { return *full_model_; }
+  const Model& GetFullModel() const { return *full_model_; }
 
   std::tuple<Cost, bool> UpdateModelAndLowerBound(
       ElementCostVector& multipliers, Cost lower_bound,
@@ -86,6 +102,7 @@ class CoreFromFullModel final : public CoreModel {
 
  private:
   Model* full_model_;
+  // TODO(c4v4): defines the core->full mappings
 };
 
 }  // namespace operations_research::scp
