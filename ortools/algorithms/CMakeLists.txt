@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-file(GLOB _SRCS "*.h" "*.cc")
+file(GLOB _SRCS "*.h" "*.cc" "set_cover/*.h" "set_cover/*.cc")
 list(FILTER _SRCS EXCLUDE REGEX "/[^/]*_test\\.cc$")
 
 set(NAME ${PROJECT_NAME}_algorithms)
