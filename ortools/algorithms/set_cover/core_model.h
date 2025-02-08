@@ -52,8 +52,8 @@ class CoreModel {
   CoreModel(Model&& core_model) : core_model_(std::move(core_model)) {}
   virtual ~CoreModel() = default;
 
-  Model& GetCoreModel() { return core_model_; }
-  const Model& GetCoreModel() const { return core_model_; }
+  Model& core_model() { return core_model_; }
+  const Model& core_model() const { return core_model_; }
 
   virtual std::tuple<Cost, bool> UpdateModelAndLowerBound(
       ElementCostVector& multipliers, Cost lower_bound, Cost upper_bound) = 0;
@@ -93,8 +93,8 @@ class CoreFromFullModel final : public CoreModel {
   CoreFromFullModel(Model&& core_model, Model* full_model)
       : CoreModel(std::move(core_model)), full_model_(full_model) {}
 
-  Model& GetFullModel() { return *full_model_; }
-  const Model& GetFullModel() const { return *full_model_; }
+  Model& full_model() { return *full_model_; }
+  const Model& full_model() const { return *full_model_; }
 
   std::tuple<Cost, bool> UpdateModelAndLowerBound(
       ElementCostVector& multipliers, Cost lower_bound,
