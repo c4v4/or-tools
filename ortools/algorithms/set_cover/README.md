@@ -13,4 +13,5 @@ This file also serves as a reference point for discussions on specific aspects o
 
 - `namespace scp`: Most set-covering related algorithms and data structures use the `SetCover*` prefix. However, for clarity and improved readability, a dedicated namespace could be used.
 - A key aspect of the CFT algorithm is managing the core vs. full model. The algorithm routinely operates on a small subset of columns (core model), refining the selection using reduced costs as a quality proxy. From past experience, correctly implementing the full/core model distinction is crucial to preventing complexity escalation in the implementation.
+- It would be beneficial to standardize the naming conventions for Subset/Column and Element/Row. While the literature often prefers Column/Row, Subset/Element may better reflect the problem's interpretation. Choosing one convention and using it consistently would enhance clarity.
 

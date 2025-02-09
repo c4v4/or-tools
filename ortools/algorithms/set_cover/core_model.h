@@ -27,9 +27,6 @@ typedef SSIZE_T ssize_t;
 
 namespace operations_research::scp {
 
-// TODO(c4v4): move SetCover* into scp namespace and rename them.
-using Model = SetCoverModel;
-
 // CoreModel extends SetCoverModel to work on a subset of the model, updating it
 // periodically using dual/Lagrangian multipliers.
 //
@@ -55,11 +52,27 @@ class CoreModel {
   Model& core_model() { return core_model_; }
   const Model& core_model() const { return core_model_; }
 
-  virtual std::tuple<Cost, bool> UpdateModelAndLowerBound(
-      ElementCostVector& multipliers, Cost lower_bound, Cost upper_bound) = 0;
+  Cost lower_bound() const { return lower_bound_; }
+  const ElementCostVector& multipliers() const { return multipliers_; }
+  void UpdateLbAndMultipliers(Cost lower_bound,
+                              ElementCostVector& multipliers) {
+    if (lower_bound < lower_bound_) {
+      lower_bound_ = lower_bound;
+      multipliers_ = multipliers;
+    }
+  }
+
+  virtual Cost UpdateCoreModel(Cost upper_bound,
+                               ElementCostVector& multipliers) = 0;
 
  private:
   Model core_model_;
+  // The best lower bound and multipliers are stored here because they become
+  // invalid when core_model_ is updated. All information related to the core
+  // model should be stored within the core model itself, so it can be updated
+  // or reset as needed.
+  Cost lower_bound_;
+  ElementCostVector multipliers_;
 };
 
 // IdentityModel is a trivial implementation of CoreModel that does not update.
@@ -69,10 +82,9 @@ class IdentityModel final : public CoreModel {
   template <typename... Args>
   IdentityModel(Args&&... args) : CoreModel(std::forward<Args>(args)...) {}
 
-  std::tuple<Cost, bool> UpdateModelAndLowerBound(
-      ElementCostVector& multipliers, Cost lower_bound,
-      Cost upper_bound) override {
-    return std::make_tuple(lower_bound, false);
+  Cost UpdateCoreModel(Cost upper_bound,
+                       ElementCostVector& multipliers) override {
+    return this->lower_bound();
   }
 };
 
@@ -85,7 +97,7 @@ class IdentityModel final : public CoreModel {
 class CoreFromFullModel final : public CoreModel {
  public:
   // The core model is automatically constructed as in [1]
-  CoreFromFullModel(Model* full_model);
+  CoreFromFullModel(const Model* full_model);
 
   // Externally provided initial core model
   CoreFromFullModel(const Model& core_model, Model* full_model)
@@ -93,15 +105,14 @@ class CoreFromFullModel final : public CoreModel {
   CoreFromFullModel(Model&& core_model, Model* full_model)
       : CoreModel(std::move(core_model)), full_model_(full_model) {}
 
-  Model& full_model() { return *full_model_; }
+  const Model& full_model() { return *full_model_; }
   const Model& full_model() const { return *full_model_; }
 
-  std::tuple<Cost, bool> UpdateModelAndLowerBound(
-      ElementCostVector& multipliers, Cost lower_bound,
-      Cost upper_bound) override;
+  Cost UpdateCoreModel(Cost upper_bound,
+                       ElementCostVector& multipliers) override;
 
  private:
-  Model* full_model_;
+  const Model* full_model_;
   // TODO(c4v4): defines the core->full mappings
 };
 

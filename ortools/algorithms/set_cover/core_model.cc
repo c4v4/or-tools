@@ -34,15 +34,15 @@ void BuildFirstCoreModel(const Model& full_model, Model& core_model) {
 
 }  // namespace
 
-CoreFromFullModel::CoreFromFullModel(Model* full_model)
+CoreFromFullModel::CoreFromFullModel(const Model* full_model)
     : full_model_(full_model) {
-  BuildFirstCoreModel(*full_model_, this->GetCoreModel());
+  BuildFirstCoreModel(*full_model_, this->core_model());
 }
 
 // TODO(c4v4): implement the pricing + column selection + mappings
-std::tuple<Cost, bool> CoreFromFullModel::UpdateModelAndLowerBound(
-    ElementCostVector& multipliers, Cost lower_bound, Cost upper_bound) {
-  return std::make_tuple(lower_bound, false);
+Cost CoreFromFullModel::UpdateCoreModel(Cost upper_bound,
+                                        ElementCostVector& multipliers) {
+  return lower_bound();
 }
 
 }  // namespace operations_research::scp

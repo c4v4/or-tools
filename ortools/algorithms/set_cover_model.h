@@ -369,4 +369,9 @@ class IntersectingSubsetsIterator {
 
 }  // namespace operations_research
 
+// TODO(c4v4): move SetCover* into scp namespace and rename them.
+namespace operations_research::scp {
+using Model = SetCoverModel;
+}  // namespace operations_research::scp
+
 #endif  // OR_TOOLS_ALGORITHMS_SET_COVER_MODEL_H_
