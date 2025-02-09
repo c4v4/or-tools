@@ -14,6 +14,7 @@
 #ifndef OR_TOOLS_ALGORITHMS_SET_COVER_CORE_MODEL_H_
 #define OR_TOOLS_ALGORITHMS_SET_COVER_CORE_MODEL_H_
 
+#include "ortools/algorithms/set_cover/reduced_costs.h"
 #if defined(_MSC_VER)
 #include <BaseTsd.h>
 typedef SSIZE_T ssize_t;
@@ -62,6 +63,8 @@ class CoreModel {
     }
   }
 
+  // Invoked at every subgradient iteration, provides a customization point to
+  // update the core model.
   virtual Cost UpdateCoreModel(Cost upper_bound,
                                ElementCostVector& multipliers) = 0;
 
@@ -95,6 +98,8 @@ class IdentityModel final : public CoreModel {
 // Method for the Set Covering Problem.” Operations Research 47 (5): 730–43.
 // https://www.jstor.org/stable/223097
 class CoreFromFullModel final : public CoreModel {
+  static constexpr size_t min_row_coverage = 5;
+
  public:
   // The core model is automatically constructed as in [1]
   CoreFromFullModel(const Model* full_model);
@@ -108,12 +113,18 @@ class CoreFromFullModel final : public CoreModel {
   const Model& full_model() { return *full_model_; }
   const Model& full_model() const { return *full_model_; }
 
+  void BuildFirstCoreModel(const Model& full_model);
   Cost UpdateCoreModel(Cost upper_bound,
                        ElementCostVector& multipliers) override;
 
  private:
   const Model* full_model_;
-  // TODO(c4v4): defines the core->full mappings
+  SubsetMapVector columns_map_;
+  ReducedCosts reduced_costs_;
+  // Managing the pricing period
+  size_t period;
+  size_t countdown;
+  size_t max_countdown;
 };
 
 }  // namespace operations_research::scp

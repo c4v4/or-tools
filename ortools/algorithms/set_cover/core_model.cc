@@ -12,37 +12,99 @@
 // limitations under the License.
 
 #include "core_model.h"
+
+#include "ortools/algorithms/set_cover_model.h"
+#include "ortools/base/stl_util.h"
 namespace operations_research::scp {
 
 namespace {
-
-// TODO(c4v4): implement the initial tentative core model from [1]
-void BuildFirstCoreModel(const Model& full_model, Model& core_model) {
-  // 1. Clear core_model from previoys data
-  // 2. Clear core->full mappings
-
-  // 3. Select the first n columns of each row (there might be duplicates)
-  // 4. Sort the column list to detect duplicates
-
-  // 5. Add columns to core model
-  // 6. Create core->full mappings
-  // 7. Fill core_model RowView
-
-  // Stub
-  core_model = full_model;
+void ExtractCoreModel(const Model& full_model,
+                      const SubsetMapVector& columns_map, Model& core_model) {
+  // Fill core model with the selected columns
+  const SparseColumnView& full_columns = full_model.columns();
+  const SubsetCostVector& full_costs = full_model.subset_costs();
+  core_model.ReserveNumSubsets(columns_map.size());
+  for (const SubsetIndex full_j : columns_map) {
+    SubsetIndex core_j(core_model.num_subsets());
+    core_model.AddEmptySubset(full_costs[full_j]);
+    for (const ElementIndex i : full_columns[full_j]) {
+      core_model.AddElementToLastSubset(i);
+    }
+  }
+  core_model.CreateSparseRowView();
 }
-
 }  // namespace
+void CoreFromFullModel::BuildFirstCoreModel(const Model& full_model) {
+  this->full_model_ = &full_model;
+  SubsetMapVector& columns_map = this->columns_map_;
+  columns_map.clear();
+  columns_map.reserve(full_model.num_elements() * min_row_coverage);
+
+  // Select the first min_row_coverage columns for each row
+  const SparseRowView& rows = full_model.rows();
+  for (const SparseRow& row : rows)
+    for (RowEntryIndex n; n < std::min(row.size(), min_row_coverage); ++n) {
+      columns_map.push_back(row[n]);
+    }
+  gtl::STLSortAndRemoveDuplicates(&columns_map);
+  ExtractCoreModel(full_model, columns_map, this->core_model());
+}
 
 CoreFromFullModel::CoreFromFullModel(const Model* full_model)
     : full_model_(full_model) {
-  BuildFirstCoreModel(*full_model_, this->core_model());
+  BuildFirstCoreModel(*full_model_);
 }
 
-// TODO(c4v4): implement the pricing + column selection + mappings
+namespace {
+// Pricing period as of [1].
+size_t ComputeNextUpdatePeriod(size_t period, size_t max_countdown,
+                               Cost lower_bound, Cost real_lower_bound,
+                               Cost upper_bound) {
+  const Cost delta = (lower_bound - real_lower_bound) / upper_bound;
+  if (delta <= 1e-6) return std::min(max_countdown, 10 * period);
+  if (delta <= 0.02) return std::min(max_countdown, 5 * period);
+  if (delta <= 0.2) return std::min(max_countdown, 2 * period);
+  return 10;
+}
+
+void SelecteMinRedCostColumns(const Model& full_model,
+                              const ReducedCosts& reduced_costs,
+                              SubsetMapVector& columns_map,
+                              SubsetBoolVector& selected) {
+  // TODO(c4v4): implement
+}
+
+void SelectMinRedCostByRow(const Model& full_model,
+                           const ReducedCosts& reduced_costs,
+                           SubsetMapVector& columns_map,
+                           SubsetBoolVector& selected) {
+  // TODO(c4v4): implement
+}
+}  // namespace
+
 Cost CoreFromFullModel::UpdateCoreModel(Cost upper_bound,
                                         ElementCostVector& multipliers) {
-  return lower_bound();
+  const Model& full_model = *this->full_model_;
+  if (--this->countdown > 0) return std::numeric_limits<Cost>::lowest();
+  Cost real_lower_bound = 0.0;
+  for (Cost multiplier : multipliers) {
+    real_lower_bound += multiplier;
+  }
+  reduced_costs_.UpdateReducedCosts(full_model, multipliers);
+  const SparseColumnView& columns = full_model.columns();
+  for (SubsetIndex j; j < reduced_costs_.size(); ++j) {
+    if (reduced_costs_[j] < 0) real_lower_bound += reduced_costs_[j];
+  }
+
+  SubsetBoolVector selected(full_model.num_subsets(), false);
+  SubsetMapVector& columns_map = this->columns_map_;
+  columns_map.clear();
+  SelecteMinRedCostColumns(full_model, reduced_costs_, columns_map, selected);
+  SelectMinRedCostByRow(full_model, reduced_costs_, columns_map, selected);
+  ExtractCoreModel(full_model, columns_map, this->core_model());
+  this->countdown = ComputeNextUpdatePeriod(
+      countdown, max_countdown, lower_bound(), real_lower_bound, upper_bound);
+  return real_lower_bound;
 }
 
 }  // namespace operations_research::scp
