@@ -524,6 +524,7 @@ foreach(SUBPROJECT IN ITEMS
  lp_data
  packing
  scheduling
+ set_cover
  port
  util)
   add_subdirectory(ortools/${SUBPROJECT})

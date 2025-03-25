@@ -1,0 +1,833 @@
+// Copyright 2025 Francesco Cavaliere
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "ortools/set_cover/set_cover_cft.h"
+
+#include <absl/algorithm/container.h>
+#include <absl/types/span.h>
+
+#include <limits>
+
+#include "ortools/algorithms/set_cover_model.h"
+#include "ortools/base/accurate_sum.h"
+#include "ortools/base/status_macros.h"
+#include "ortools/base/stl_util.h"
+#include "ortools/util/fp_utils.h"
+
+namespace operations_research::scp {
+
+////////////////////////////////////////////////////////////////////////
+////////////////////////// COMMON DEFINITIONS //////////////////////////
+////////////////////////////////////////////////////////////////////////
+namespace {
+class CoverCounters {
+ public:
+  CoverCounters(BaseInt nelems = 0) : cov_counters(nelems, 0) {}
+  void Reset(BaseInt nelems) { cov_counters.assign(nelems, 0); }
+  BaseInt Size() const { return cov_counters.size(); }
+  BaseInt operator[](ElementIndex i) const {
+    assert(i < cov_counters.size());
+    return cov_counters[i];
+  }
+
+  template <typename IterableT>
+  BaseInt Cover(IterableT const& subset) {
+    BaseInt covered = 0;
+    for (ElementIndex i : subset) {
+      covered += cov_counters[i] == 0 ? 1ULL : 0ULL;
+      cov_counters[i]++;
+    }
+    return covered;
+  }
+
+  template <typename IterableT>
+  BaseInt Uncover(IterableT const& subset) {
+    BaseInt uncovered = 0;
+    for (ElementIndex i : subset) {
+      --cov_counters[i];
+      uncovered += cov_counters[i] == 0 ? 1ULL : 0ULL;
+    }
+    return uncovered;
+  }
+
+  // Check if all the elements of a subset are already covered.
+  template <typename IterableT>
+  bool IsRedundantCover(IterableT const& subset) const {
+    return absl::c_all_of(subset,
+                          [&](ElementIndex i) { return cov_counters[i] > 0; });
+  }
+
+  // Check if all the elements would still be covered if the subset was removed.
+  template <typename IterableT>
+  bool IsRedundantUncover(IterableT const& subset) const {
+    return absl::c_all_of(subset,
+                          [&](ElementIndex i) { return cov_counters[i] > 1; });
+  }
+
+ private:
+  ElementToIntVector cov_counters;
+};
+
+}  // namespace
+
+absl::Status ValidateModel(const Model& model) {
+  if (model.rows().size() != model.num_elements()) {
+    return absl::InvalidArgumentError("Model has no rows.");
+  }
+  if (model.columns().size() != model.num_subsets()) {
+    return absl::InvalidArgumentError("Model has no columns.");
+  }
+  if (model.subset_costs().size() != model.num_subsets()) {
+    return absl::InvalidArgumentError("Model has no subset costs.");
+  }
+  if (model.num_elements() <= 0) {
+    return absl::InvalidArgumentError("Model has no elements.");
+  }
+  if (model.num_subsets() <= 0) {
+    return absl::InvalidArgumentError("Model has no subsets.");
+  }
+  if (!model.ComputeFeasibility()) {
+    return absl::InvalidArgumentError("Model is infeasible.");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateFeasibleSolution(const Model& model,
+                                      const Solution& solution,
+                                      Cost tolerance) {
+  AccurateSum<Cost> solution_cost;
+  CoverCounters coverage(model.num_elements());
+  const SparseColumnView& columns = model.columns();
+  const SubsetCostVector& subset_costs = model.subset_costs();
+  for (SubsetIndex subset : solution.subsets()) {
+    solution_cost.Add(subset_costs[subset]);
+    coverage.Cover(columns[subset]);
+  }
+  if (!AreWithinAbsoluteOrRelativeTolerances(
+          solution_cost.Value(), solution.cost(), tolerance, tolerance))
+    return absl::InvalidArgumentError("Solution cost is incorrect.");
+  for (ElementIndex element : model.ElementRange()) {
+    if (coverage[element] == 0) {
+      return absl::InvalidArgumentError("Solution is infeasible.");
+    }
+  }
+  return absl::OkStatus();
+}
+
+// NOTE: This function contains one of the two O(nnz) subgradient steps
+template <typename Op>
+void DualState::DualUpdate(const Model& model, Op multiplier_generator) {
+  multipliers_.resize(model.num_elements());
+  reduced_costs_.resize(model.num_subsets());
+  lower_bound_ = {};
+
+  // Update multipliers
+  for (ElementIndex i : model.ElementRange()) {
+    multipliers_[i] = multiplier_generator(i, multipliers_[i]);
+    lower_bound_.Add(multipliers_[i]);
+    DCHECK_GE(multipliers_[i], .0);
+  }
+
+  // Compute new reduced costs (O(nnz))
+  for (SubsetIndex j : model.SubsetRange()) {
+    reduced_costs_[j] = model.subset_costs()[j];
+    for (ElementIndex i : model.columns()[j]) {
+      reduced_costs_[j] -= multipliers_[i];
+    }
+    if (reduced_costs_[j] < .0) {
+      lower_bound_.Add(reduced_costs_[j]);
+    }
+  }
+}
+
+DualState::DualState(const Model& model)
+    : lower_bound_(),
+      multipliers_(model.num_elements(), std::numeric_limits<Cost>::max()),
+      reduced_costs_(model.subset_costs()) {
+  DualUpdate(model, [&](ElementIndex i, Cost i_multiplier) {
+    for (SubsetIndex j : model.rows()[i]) {
+      Cost candidate = model.subset_costs()[j] / model.columns()[j].size();
+      i_multiplier = std::min(i_multiplier, candidate);
+    }
+    return i_multiplier;
+  });
+}
+
+void DualState::UpdateMultipliers(const Model& model,
+                                  const ElementCostVector& multiplier_deltas) {
+  CHECK_EQ(multiplier_deltas.size(), model.num_elements());
+  DualUpdate(model, [&](ElementIndex i, Cost i_mult) {
+    return std::max(.0, i_mult + multiplier_deltas[i]);
+  });
+}
+
+void DualState::SetMultipliers(const Model& model,
+                               const ElementCostVector& new_multipliers) {
+  CHECK_EQ(new_multipliers.size(), model.num_elements());
+  DualUpdate(model, [&](ElementIndex i, Cost) { return new_multipliers[i]; });
+}
+
+///////////////////////////////////////////////////////////////////////
+///////////////////////////// SUBGRADIENT /////////////////////////////
+///////////////////////////////////////////////////////////////////////
+
+CftSubgradientCBs::CftSubgradientCBs(const Model& model)
+    : squared_norm_(static_cast<Cost>(model.num_elements())),
+      direction_(ElementCostVector(model.num_elements(), .0)),
+      prev_best_lb_(.0),
+      max_iter_countdown_(10 * model.num_elements()),  // Arbitrary from [1]
+      exit_test_countdown_(300),                       // Arbitrary from [1]
+      exit_test_period_(300),                          // Arbitrary from [1]
+      step_size_(0.1),                                 // Arbitrary from [1]
+      last_min_lb_seen_(std::numeric_limits<Cost>::max()),
+      last_max_lb_seen_(.0),
+      step_size_update_countdown_(20),  // Arbitrary from [1]
+      step_size_update_period_(20)      // Arbitrary from [1]
+{}
+
+bool CftSubgradientCBs::ExitCondition(const SubgradientContext& context) {
+  if (--max_iter_countdown_ <= 0 || squared_norm_ <= kTol) {
+    return true;
+  }
+  if (--exit_test_countdown_ > 0) {
+    return false;
+  }
+  exit_test_countdown_ = exit_test_period_;
+  Cost best_lower_bound = context.best_dual_state.lower_bound();
+  Cost abs_improvement = best_lower_bound - prev_best_lb_;
+  Cost rel_improvement = DivideIfGE0(abs_improvement, best_lower_bound);
+  prev_best_lb_ = best_lower_bound;
+  return abs_improvement < 1.0 && rel_improvement < .001;
+}
+
+absl::Status CftSubgradientCBs::ComputeMultipliersDelta(
+    const SubgradientContext& context, ElementCostVector& delta_mults) {
+  Cost lower_bound = context.current_dual_state.lower_bound();
+  UpdateStepSize(lower_bound);
+
+  direction_ = context.subgradient;
+  MakeMinimalCoverageSubgradient(context, direction_);
+
+  squared_norm_ = .0;
+  for (ElementIndex i : context.model.ElementRange()) {
+    squared_norm_ += direction_[i] * direction_[i];
+  }
+
+  Cost upper_bound = context.best_solution.cost();
+  Cost delta = upper_bound - lower_bound;
+  Cost step_constant = step_size_ * delta / squared_norm_;
+  for (ElementIndex i : context.model.ElementRange()) {
+    delta_mults[i] = step_constant * direction_[i];
+  }
+
+  return absl::OkStatus();
+}
+
+void CftSubgradientCBs::UpdateStepSize(Cost lower_bound) {
+  last_min_lb_seen_ = std::min(last_min_lb_seen_, lower_bound);
+  last_max_lb_seen_ = std::max(last_max_lb_seen_, lower_bound);
+
+  if (--step_size_update_countdown_ <= 0) {
+    step_size_update_countdown_ = step_size_update_period_;
+
+    Cost delta = last_max_lb_seen_ - last_min_lb_seen_;
+    Cost gap = DivideIfGE0(delta, last_max_lb_seen_);
+    if (gap <= .001) {       //
+      step_size_ *= 1.5;     // Arbitray
+    } else if (gap > .01) {  // from [1]
+      step_size_ /= 2.0;     //
+    }
+    last_min_lb_seen_ = std::numeric_limits<Cost>::max();
+    last_max_lb_seen_ = .0;
+    // Not described in the paper, but in rare cases the subgradient diverges
+    step_size_ = std::clamp(step_size_, 1e-6, 10.0);
+  }
+}
+
+void CftSubgradientCBs::MakeMinimalCoverageSubgradient(
+    const SubgradientContext& context, ElementCostVector& subgradient) {
+  lagrangian_solution_.clear();
+  const auto& reduced_costs = context.current_dual_state.reduced_costs();
+  for (SubsetIndex j : context.model.SubsetRange()) {
+    if (reduced_costs[j] < .0) {
+      lagrangian_solution_.push_back(j);
+    }
+  }
+
+  absl::c_sort(lagrangian_solution_, [&](SubsetIndex j1, SubsetIndex j2) {
+    return reduced_costs[j1] > reduced_costs[j2];
+  });
+
+  const SparseColumnView& cols = context.model.columns();
+  for (SubsetIndex j : lagrangian_solution_) {
+    if (absl::c_all_of(cols[j], [&](auto i) { return subgradient[i] < 0; })) {
+      absl::c_for_each(cols[j], [&](auto i) { subgradient[i] += 1.0; });
+    }
+  }
+}
+
+absl::StatusOr<PrimalDualState> SubgradientOptimization(
+    CoreModel& model, SubgradientCBs& cbs, const PrimalDualState& init_state) {
+  DCHECK_OK(ValidateModel(model));
+  DCHECK_OK(ValidateFeasibleSolution(model, init_state.solution));
+
+  ElementCostVector subgradient = ElementCostVector(model.num_elements(), .0);
+  PrimalDualState best_state = init_state;
+  DualState dual_state = init_state.dual_state;
+  Solution solution = init_state.solution;
+
+  ElementCostVector multipliers_delta(model.num_elements());  // to avoid allocs
+  SubgradientContext context = {.model = model,
+                                .current_dual_state = dual_state,
+                                .best_dual_state = best_state.dual_state,
+                                .best_solution = best_state.solution,
+                                .subgradient = subgradient};
+  size_t iter = 0;
+  while (!cbs.ExitCondition(context)) {
+    // Compute subgradient (O(nnz))
+    subgradient.assign(model.num_elements(), 1.0);
+    for (SubsetIndex j : model.SubsetRange()) {
+      if (dual_state.reduced_costs()[j] < .0) {
+        for (ElementIndex i : model.columns()[j]) {
+          subgradient[i] -= 1.0;
+        }
+      }
+    }
+
+    RETURN_IF_ERROR(cbs.ComputeMultipliersDelta(context, multipliers_delta));
+    dual_state.UpdateMultipliers(model, multipliers_delta);
+    if (dual_state.lower_bound() > best_state.dual_state.lower_bound()) {
+      best_state.dual_state = dual_state;
+    }
+
+    RETURN_IF_ERROR(cbs.RunHeuristic(context, solution));
+    if (!solution.subsets().empty() &&
+        solution.cost() < best_state.solution.cost()) {
+      best_state.solution = solution;
+    }
+
+    if (model.UpdateCore(best_state)) {
+      dual_state = best_state.dual_state;
+    }
+
+    std::cout << "Subgradient Iteration: " << ++iter
+              << "\n  Lower bound:      " << dual_state.lower_bound()
+              << " (best: " << best_state.dual_state.lower_bound()
+              << ")\n  Solution cost: " << best_state.solution.cost() << "\n";
+  }
+
+  return {std::move(best_state)};
+}
+
+///////////////////////////////////////////////////////////////////////
+//////////////////////// FULL TO CORE PRICING /////////////////////////
+///////////////////////////////////////////////////////////////////////
+
+namespace {
+void FillTentativeCoreModel(const Model& full_model, Model& core_model) {
+  static constexpr BaseInt kMinCov = 5;
+  core_model = full_model;
+
+  /* columns_map_.clear();
+  columns_map_.reserve(full_model.num_elements() * kMinCov);
+
+  // Select the first min_row_coverage columns for each row
+  const SparseRowView& rows = full_model.rows();
+  for (const SparseRow& row : rows)
+    for (RowEntryIndex n; n < std::min(row.size(), kMinCov); ++n) {
+      columns_map_.push_back(row[n]);
+    }
+  gtl::STLSortAndRemoveDuplicates(&columns_map_);
+  ExtractCoreModel(full_model, columns_map_, *this); */
+}
+
+void ExtractCoreModel(const Model& full_model,
+                      const SubsetMapVector& columns_map, Model& core_model) {
+  // Fill core model with the selected columns
+  /* const SparseColumnView& full_columns = full_model.columns();
+  const SubsetCostVector& full_costs = full_model.subset_costs();
+  core_model.ReserveNumSubsets(columns_map.size());
+  for (const SubsetIndex full_j : columns_map) {
+    SubsetIndex core_j(core_model.num_subsets());
+    core_model.AddEmptySubset(full_costs[full_j]);
+    for (const ElementIndex i : full_columns[full_j]) {
+      core_model.AddElementToLastSubset(i);
+    }
+  }
+  core_model.CreateSparseRowView(); */
+}
+
+void SelecteMinRedCostColumns(const Model& full_model_,
+                              const DualState& full_dual_state_,
+                              SubsetMapVector& columns_map,
+                              SubsetBoolVector& selected) {
+  // TODO(cava): implement
+}
+static void SelectMinRedCostByRow(const Model& full_model_,
+                                  const DualState& full_dual_state_,
+                                  SubsetMapVector& columns_map,
+                                  SubsetBoolVector& selected) {
+  // TODO(cava): implement
+}
+}  // namespace
+
+FullToCoreModel::FullToCoreModel(Model&& full_model)
+    : CoreModel(),
+      full_model_(std::move(full_model)),
+      full_dual_state_(full_model_),
+      update_countdown_(10),
+      update_period_(10),
+      update_max_period_(std::min(1000, full_model_.num_elements() / 3)) {
+  FillTentativeCoreModel(full_model_, static_cast<Model&>(*this));
+}
+
+bool FullToCoreModel::UpdateCore(PrimalDualState& core_state) {
+  if (--update_countdown_ > 0) {
+    return false;
+  }
+  full_dual_state_.SetMultipliers(*this, core_state.dual_state.multipliers());
+
+  SubsetBoolVector selected(full_model_.num_subsets(), false);
+  SubsetMapVector& columns_map = columns_map_;
+  columns_map.clear();
+  SelecteMinRedCostColumns(full_model_, full_dual_state_, columns_map,
+                           selected);
+  SelectMinRedCostByRow(full_model_, full_dual_state_, columns_map, selected);
+  ExtractCoreModel(full_model_, columns_map, *this);
+  UpdatePricingPeriod(full_dual_state_, core_state);
+
+  return true;
+}
+
+void FullToCoreModel::UpdatePricingPeriod(const DualState& full_dual_state,
+                                          const PrimalDualState& core_state) {
+  DCHECK_GE(core_state.dual_state.lower_bound(), full_dual_state.lower_bound());
+  DCHECK_GE(core_state.solution.cost(), .0);
+
+  Cost delta =
+      core_state.dual_state.lower_bound() - full_dual_state.lower_bound();
+  Cost ratio = DivideIfGE0(delta, core_state.solution.cost());
+  if (ratio <= 1e-6) {
+    update_period_ = std::min(update_max_period_, 10 * update_period_);
+  } else if (ratio <= 0.02) {
+    update_period_ = std::min(update_max_period_, 5 * update_period_);
+  } else if (ratio <= 0.2) {
+    update_period_ = std::min(update_max_period_, 2 * update_period_);
+  } else {
+    update_period_ = 10;
+  }
+  update_countdown_ = update_period_;
+}
+
+////////////////////////////////////////////////////////////////////////
+/////////////////////// MULTIPLIERS BASED GREEDY ///////////////////////
+////////////////////////////////////////////////////////////////////////
+namespace {
+
+struct Score {
+  Cost score;
+  SubsetIndex idx;
+};
+
+class GreedyScores {
+ public:
+  static constexpr BaseInt removed_idx = -1;
+  static constexpr Cost max_score = std::numeric_limits<Cost>::max();
+
+  GreedyScores(const Model& model, const DualState& dual_state,
+               const Solution& solution)
+      : bad_size_(),
+        worst_good_score_(std::numeric_limits<Cost>::lowest()),
+        scores_(),
+        reduced_costs_(dual_state.reduced_costs()),
+        covering_counts_(model.num_subsets()),
+        score_map_(model.num_subsets()) {
+    BaseInt s = 0;
+    for (SubsetIndex j : model.SubsetRange()) {
+      covering_counts_[j] = model.columns()[j].size();
+      Cost j_score = ComputeScore(reduced_costs_[j], covering_counts_[j]);
+      scores_.push_back({j_score, j});
+      score_map_[j] = s++;
+      DCHECK(std::isfinite(reduced_costs_[j]));
+      DCHECK(std::isfinite(j_score));
+    }
+    bad_size_ = scores_.size();
+  }
+
+  SubsetIndex FindMinScoreColumn(const Model& model,
+                                 const DualState& dual_state) {
+    // Check if the bad/good partition should be updated
+    if (bad_size_ == scores_.size()) {
+      if (bad_size_ > model.num_elements()) {
+        bad_size_ = bad_size_ - model.num_elements();
+        absl::c_nth_element(scores_, scores_.begin() + bad_size_,
+                            [](Score a, Score b) { return a.score > b.score; });
+        worst_good_score_ = scores_[bad_size_].score;
+        for (BaseInt s = 0; s < scores_.size(); ++s) {
+          score_map_[scores_[s].idx] = s;
+        }
+      } else {
+        bad_size_ = 0;
+        worst_good_score_ = max_score;
+      }
+      DCHECK(bad_size_ > 0 || worst_good_score_ == max_score);
+    }
+
+    Score min_score =
+        *std::min_element(scores_.begin() + bad_size_, scores_.end(),
+                          [](Score a, Score b) { return a.score < b.score; });
+    SubsetIndex j_star = min_score.idx;
+    DCHECK_LT(min_score.score, max_score);
+
+    return j_star;
+  }
+
+  // For each row in the given set, if `cond` returns true, the row is
+  // considered newly covered. The function then iterates over the columns of
+  // that row, updating the scores of the columns accordingly.
+  template <typename ElementSpanT, typename CondT>
+  BaseInt UpdateColumnsScoreOfRowsIf(const SparseRowView& rows,
+                                     const ElementCostVector& multipliers,
+                                     const ElementSpanT& row_idxs, CondT cond) {
+    BaseInt processed_rows_count = 0;
+    for (ElementIndex i : row_idxs) {
+      if (!cond(i)) {
+        continue;
+      }
+
+      ++processed_rows_count;
+      for (SubsetIndex j : rows[i]) {
+        covering_counts_[j] -= 1;
+        reduced_costs_[j] += multipliers[i];
+
+        BaseInt s = score_map_[j];
+        DCHECK_NE(s, removed_idx) << "Column is not in the score map";
+        scores_[s].score = ComputeScore(reduced_costs_[j], covering_counts_[j]);
+
+        if (covering_counts_[j] == 0) {
+          // Column is redundant: its score can be removed
+          if (s < bad_size_) {
+            // Column is bad: promote to good partition before removal
+            SwapScores(s, bad_size_ - 1);
+            s = --bad_size_;
+          }
+          SwapScores(s, scores_.size() - 1);
+          scores_.pop_back();
+        } else if (s >= bad_size_ && scores_[s].score > worst_good_score_) {
+          // Column not good anymore: move it into bad partition
+          SwapScores(s, bad_size_++);
+        }
+      }
+    }
+    return processed_rows_count;
+  }
+
+ private:
+  void SwapScores(BaseInt s1, BaseInt s2) {
+    SubsetIndex j1 = scores_[s1].idx, j2 = scores_[s2].idx;
+    std::swap(scores_[s1], scores_[s2]);
+    std::swap(score_map_[j1], score_map_[j2]);
+  }
+
+  // Score computed as described in [1]
+  static Cost ComputeScore(Cost adjusted_reduced_cost,
+                           BaseInt num_rows_covered) {
+    DCHECK(std::isfinite(adjusted_reduced_cost)) << "Gamma is not finite";
+    return num_rows_covered == 0
+               ? max_score
+               : (adjusted_reduced_cost > .0
+                      ? adjusted_reduced_cost / num_rows_covered
+                      : adjusted_reduced_cost * num_rows_covered);
+  }
+
+ private:
+  // scores_ is partitioned into bad-scores / good-scores
+  BaseInt bad_size_;
+
+  // sentinel level to trigger a partition update of the scores
+  Cost worst_good_score_;
+
+  // column scores kept updated
+  std::vector<Score> scores_;
+
+  // reduced costs adjusted to currently uncovered rows (size=n)
+  SubsetCostVector reduced_costs_;
+
+  // number of uncovered rows covered by each column (size=n)
+  SubsetToIntVector covering_counts_;
+
+  // position of each column score into the scores_
+  SubsetToIntVector score_map_;
+};
+
+// Stores the redundancy set and related information
+class RedundancyRemover {
+ public:
+  RedundancyRemover(const Model& model, CoverCounters& total_coverage)
+      : redund_set_(),
+        total_coverage_(total_coverage),
+        partial_coverage_(model.num_elements()),
+        partial_cost_(.0),
+        partial_size_(0),
+        partial_cov_count_(0),
+        cols_to_remove_() {}
+
+  bool TryRemoveRedundantCols(const Model& model, Cost cost_cutoff,
+                              std::vector<SubsetIndex>& partial_sol) {
+    for (SubsetIndex j : partial_sol) {
+      if (total_coverage_.IsRedundantUncover(model.columns()[j]))
+        redund_set_.push_back({model.subset_costs()[j], j});
+      else {
+        ++partial_size_;
+        partial_cost_ += model.subset_costs()[j];
+        partial_cov_count_ += partial_coverage_.Cover(model.columns()[j]);
+      }
+      if (partial_cost_ >= cost_cutoff) {
+        return false;
+      }
+    }
+    if (redund_set_.empty()) {
+      return false;
+    }
+    absl::c_sort(redund_set_,
+                 [](Score a, Score b) { return a.score < b.score; });
+
+    if (partial_cov_count_ < model.num_elements()) {
+      // Complete partial solution heuristically
+      HeuristicRedundancyRemoval(model, cost_cutoff);
+    } else {
+      // All redundant columns can be removed
+      for (Score redund_col : redund_set_) {
+        cols_to_remove_.push_back(redund_col.idx);
+      }
+    }
+
+    // Note: In [1], an enumeration to selected the best redundant columns to
+    // remove is performed when the number of redundant columns is <= 10.
+    // However, based on experiments with github.com/c4v4/cft/, it appears that
+    // this enumeration does not provide significant benefits to justify the
+    // added complexity.
+
+    if (partial_cost_ < cost_cutoff) {
+      gtl::STLEraseAllFromSequenceIf(&partial_sol, [&](auto j) {
+        return absl::c_any_of(cols_to_remove_,
+                              [j](auto j_r) { return j_r == j; });
+      });
+      return true;
+    }
+    return false;
+  }
+
+  bool CanRemoveColumn(SubsetIndex j) {
+    return absl::c_any_of(cols_to_remove_,
+                          [j](SubsetIndex r) { return r == j; });
+  }
+
+ private:
+  // Remove redundant columns from the redundancy set using a heuristic
+  void HeuristicRedundancyRemoval(const Model& model, Cost cost_cutoff) {
+    while (!redund_set_.empty()) {
+      if (partial_cov_count_ == model.num_elements()) {
+        return;
+      }
+      SubsetIndex j = redund_set_.back().idx;
+      const SparseColumn& j_col = model.columns()[j];
+      redund_set_.pop_back();
+
+      if (total_coverage_.IsRedundantUncover(j_col)) {
+        total_coverage_.Uncover(j_col);
+        cols_to_remove_.push_back(j);
+      } else {
+        partial_cost_ += model.subset_costs()[j];
+        partial_cov_count_ += partial_coverage_.Cover(j_col);
+      }
+    }
+  }
+
+ private:
+  // redundant columns + their cost
+  std::vector<Score> redund_set_;
+
+  // row-cov if all the remaining columns are selected
+  CoverCounters total_coverage_;
+
+  // row-cov if we selected the current column
+  CoverCounters partial_coverage_;
+
+  // current partial solution cost
+  Cost partial_cost_;
+
+  // current partial solution size
+  BaseInt partial_size_;
+
+  // number of covered rows
+  Cost partial_cov_count_;
+
+  // list of columns to remove
+  std::vector<SubsetIndex> cols_to_remove_;
+};
+
+}  // namespace
+
+absl::Status CompleteGreedySolution(const Model& model, Solution& solution) {
+  return CompleteGreedySolution(model, DualState(model),
+                                std::numeric_limits<Cost>::max(),
+                                std::numeric_limits<BaseInt>::max(), solution);
+}
+
+absl::Status CompleteGreedySolution(const Model& model,
+                                    const DualState& dual_state,
+                                    Cost cost_cutoff, BaseInt stop_size,
+                                    Solution& solution) {
+  if (solution.cost() >= cost_cutoff) {
+    // Solution worse than cutoff -> discard it
+    solution.Clear();
+    return absl::OkStatus();
+  }
+  if (solution.subsets().size() >= stop_size) {
+    // Solution already has required size -> early exit
+    return absl::OkStatus();
+  }
+
+  // Process input solution (if not empty)
+  BaseInt num_rows_to_cover = model.num_elements();
+  CoverCounters covered_rows(model.num_elements());
+  for (SubsetIndex j : solution.subsets()) {
+    num_rows_to_cover -= covered_rows.Cover(model.columns()[j]);
+    if (num_rows_to_cover == 0) {
+      return absl::OkStatus();
+    }
+  }
+
+  // Initialize column scores taking into account rows already covered
+  GreedyScores scores(model, dual_state, solution);  // TODO(?): cache it!
+  std::vector<SubsetIndex> partial_sol = solution.subsets();
+  if (!partial_sol.empty()) {
+    scores.UpdateColumnsScoreOfRowsIf(
+        model.rows(), dual_state.multipliers(), model.ElementRange(),
+        [&](auto i) { return covered_rows[i] > 0; });
+  }
+
+  // Fill up partial solution
+  while (num_rows_to_cover > 0 && partial_sol.size() < stop_size) {
+    SubsetIndex j_star = scores.FindMinScoreColumn(model, dual_state);
+    const SparseColumn& column = model.columns()[j_star];
+    num_rows_to_cover -= scores.UpdateColumnsScoreOfRowsIf(
+        model.rows(), dual_state.multipliers(), column,
+        [&](auto i) { return covered_rows[i] == 0; });
+    partial_sol.push_back(j_star);
+    covered_rows.Cover(column);
+  }
+
+  // Either remove redundant columns or discard solution
+  solution.Clear();
+  RedundancyRemover remover(model, covered_rows);  // TODO(?): cache it!
+  if (remover.TryRemoveRedundantCols(model, cost_cutoff, partial_sol)) {
+    for (SubsetIndex j : partial_sol) {
+      solution.AddSubset(j, model.subset_costs()[j]);
+    }
+  }
+
+  return absl::OkStatus();
+}
+
+///////////////////////////////////////////////////////////////////////
+//////////////////////// THREE PHASE ALGORITHM ////////////////////////
+///////////////////////////////////////////////////////////////////////
+namespace {
+// TODO(cava): implement
+absl::Status FixBestColumns(CoreModel& model, PrimalDualState& ctx) {
+  return absl::UnimplementedError(ABSL_PRETTY_FUNCTION);
+}
+
+// TODO(cava): implement
+absl::Status RandomizeDualState(DualState& dual_state) {
+  return absl::UnimplementedError(ABSL_PRETTY_FUNCTION);
+}
+}  // namespace
+
+absl::Status HeuristicCBs::RunHeuristic(const SubgradientContext& context,
+                                        Solution& solution) {
+  return CompleteGreedySolution(context.model, context.current_dual_state,
+                                context.best_solution.cost(),
+                                std::numeric_limits<BaseInt>::max(), solution);
+}
+
+absl::Status HeuristicCBs::ComputeMultipliersDelta(
+    const SubgradientContext& context, ElementCostVector& delta_mults) {
+  Cost squared_norm = .0;
+  for (ElementIndex i : context.model.ElementRange()) {
+    squared_norm += context.subgradient[i] * context.subgradient[i];
+  }
+
+  Cost lower_bound = context.current_dual_state.lower_bound();
+  Cost upper_bound = context.best_solution.cost();
+  DCHECK_GE(upper_bound, lower_bound);
+  Cost delta = upper_bound - lower_bound;
+  Cost step_constant = step_size_ * delta / squared_norm;
+  for (ElementIndex i : context.model.ElementRange()) {
+    delta_mults[i] = step_constant * context.subgradient[i];
+  }
+
+  return absl::OkStatus();
+}
+
+absl::StatusOr<PrimalDualState> RunThreePhase(CoreModel& model,
+                                              const Solution& init_solution) {
+  model.CreateSparseRowView();
+  RETURN_IF_ERROR(ValidateModel(model));
+
+  PrimalDualState best_state = {.solution = init_solution,
+                                .dual_state = DualState(model)};
+  if (best_state.solution.Empty()) {
+    RETURN_IF_ERROR(CompleteGreedySolution(model, best_state.solution));
+  }
+  RETURN_IF_ERROR(ValidateFeasibleSolution(model, best_state.solution));
+  std::cout << "Initial lower bound: " << best_state.dual_state.lower_bound()
+            << "\nInitial solution cost: " << best_state.solution.cost()
+            << "\nStarting 3-phase algorithm\n";
+
+  PrimalDualState curr_state = best_state;
+  CftSubgradientCBs lower_bound_cbs(model);
+  HeuristicCBs heuristic_cbs;
+  BaseInt iter_count = 0;
+  while (model.num_elements() > 0) {
+    ++iter_count;
+
+    // Phase 1: refine the current dual_state and model
+    ASSIGN_OR_RETURN(curr_state, SubgradientOptimization(model, lower_bound_cbs,
+                                                         curr_state));
+    if (iter_count == 1) {
+      best_state.dual_state = curr_state.dual_state;
+    }
+    std::cout << "Iterartion " << iter_count
+              << "\n - Lower bound: " << curr_state.dual_state.lower_bound()
+              << "\n - Solution cost: " << curr_state.solution.cost() << '\n';
+
+    // Phase 2: search for good solutions
+    heuristic_cbs.set_step_size(lower_bound_cbs.step_size());
+    ASSIGN_OR_RETURN(curr_state,
+                     SubgradientOptimization(model, heuristic_cbs, curr_state));
+    if (curr_state.solution.cost() < best_state.solution.cost()) {
+      best_state = curr_state;
+    }
+
+    // Phase 3: Fix the best columns (diving)
+    RETURN_IF_ERROR(FixBestColumns(model, curr_state));
+    RETURN_IF_ERROR(RandomizeDualState(curr_state.dual_state));
+  }
+
+  return best_state;
+}
+
+}  // namespace operations_research::scp
