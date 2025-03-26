@@ -14,6 +14,7 @@
 #include "ortools/set_cover/set_cover_cft.h"
 
 #include <absl/algorithm/container.h>
+#include <absl/status/status.h>
 #include <absl/types/span.h>
 
 #include <limits>
@@ -181,10 +182,10 @@ void DualState::SetMultipliers(const Model& model,
 ///////////////////////////// SUBGRADIENT /////////////////////////////
 ///////////////////////////////////////////////////////////////////////
 
-CftSubgradientCBs::CftSubgradientCBs(const Model& model)
+BoundCBs::BoundCBs(const Model& model)
     : squared_norm_(static_cast<Cost>(model.num_elements())),
       direction_(ElementCostVector(model.num_elements(), .0)),
-      prev_best_lb_(.0),
+      prev_best_lb_(std::numeric_limits<Cost>::lowest()),
       max_iter_countdown_(10 * model.num_elements()),  // Arbitrary from [1]
       exit_test_countdown_(300),                       // Arbitrary from [1]
       exit_test_period_(300),                          // Arbitrary from [1]
@@ -195,7 +196,7 @@ CftSubgradientCBs::CftSubgradientCBs(const Model& model)
       step_size_update_period_(20)      // Arbitrary from [1]
 {}
 
-bool CftSubgradientCBs::ExitCondition(const SubgradientContext& context) {
+bool BoundCBs::ExitCondition(const SubgradientContext& context) {
   if (--max_iter_countdown_ <= 0 || squared_norm_ <= kTol) {
     return true;
   }
@@ -210,8 +211,8 @@ bool CftSubgradientCBs::ExitCondition(const SubgradientContext& context) {
   return abs_improvement < 1.0 && rel_improvement < .001;
 }
 
-absl::Status CftSubgradientCBs::ComputeMultipliersDelta(
-    const SubgradientContext& context, ElementCostVector& delta_mults) {
+void BoundCBs::ComputeMultipliersDelta(const SubgradientContext& context,
+                                       ElementCostVector& delta_mults) {
   Cost lower_bound = context.current_dual_state.lower_bound();
   UpdateStepSize(lower_bound);
 
@@ -229,11 +230,9 @@ absl::Status CftSubgradientCBs::ComputeMultipliersDelta(
   for (ElementIndex i : context.model.ElementRange()) {
     delta_mults[i] = step_constant * direction_[i];
   }
-
-  return absl::OkStatus();
 }
 
-void CftSubgradientCBs::UpdateStepSize(Cost lower_bound) {
+void BoundCBs::UpdateStepSize(Cost lower_bound) {
   last_min_lb_seen_ = std::min(last_min_lb_seen_, lower_bound);
   last_max_lb_seen_ = std::max(last_max_lb_seen_, lower_bound);
 
@@ -254,8 +253,8 @@ void CftSubgradientCBs::UpdateStepSize(Cost lower_bound) {
   }
 }
 
-void CftSubgradientCBs::MakeMinimalCoverageSubgradient(
-    const SubgradientContext& context, ElementCostVector& subgradient) {
+void BoundCBs::MakeMinimalCoverageSubgradient(const SubgradientContext& context,
+                                              ElementCostVector& subgradient) {
   lagrangian_solution_.clear();
   const auto& reduced_costs = context.current_dual_state.reduced_costs();
   for (SubsetIndex j : context.model.SubsetRange()) {
@@ -276,15 +275,27 @@ void CftSubgradientCBs::MakeMinimalCoverageSubgradient(
   }
 }
 
-absl::StatusOr<PrimalDualState> SubgradientOptimization(
-    CoreModel& model, SubgradientCBs& cbs, const PrimalDualState& init_state) {
+bool BoundCBs::UpdateCoreModel(CoreModel& core_model,
+                               PrimalDualState& best_state) {
+  if (core_model.UpdateCore(best_state)) {
+    // grant at least 10 iterations before the next exit test
+    prev_best_lb_ =
+        std::min(prev_best_lb_, best_state.dual_state.lower_bound());
+    exit_test_countdown_ = std::max(exit_test_countdown_, 10);
+    max_iter_countdown_ = std::max(max_iter_countdown_, 10);
+    return true;
+  }
+  return false;
+}
+
+absl::Status SubgradientOptimization(CoreModel& model, SubgradientCBs& cbs,
+                                     PrimalDualState& best_state) {
   DCHECK_OK(ValidateModel(model));
-  DCHECK_OK(ValidateFeasibleSolution(model, init_state.solution));
+  DCHECK_OK(ValidateFeasibleSolution(model, best_state.solution));
 
   ElementCostVector subgradient = ElementCostVector(model.num_elements(), .0);
-  PrimalDualState best_state = init_state;
-  DualState dual_state = init_state.dual_state;
-  Solution solution = init_state.solution;
+  DualState dual_state = best_state.dual_state;
+  Solution solution = best_state.solution;
 
   ElementCostVector multipliers_delta(model.num_elements());  // to avoid allocs
   SubgradientContext context = {.model = model,
@@ -304,19 +315,20 @@ absl::StatusOr<PrimalDualState> SubgradientOptimization(
       }
     }
 
-    RETURN_IF_ERROR(cbs.ComputeMultipliersDelta(context, multipliers_delta));
+    cbs.ComputeMultipliersDelta(context, multipliers_delta);
     dual_state.UpdateMultipliers(model, multipliers_delta);
     if (dual_state.lower_bound() > best_state.dual_state.lower_bound()) {
       best_state.dual_state = dual_state;
     }
 
-    RETURN_IF_ERROR(cbs.RunHeuristic(context, solution));
+    cbs.RunHeuristic(context, solution);
     if (!solution.subsets().empty() &&
         solution.cost() < best_state.solution.cost()) {
       best_state.solution = solution;
     }
 
-    if (model.UpdateCore(best_state)) {
+    if (cbs.UpdateCoreModel(model, best_state)) {
+      std::cout << "Core model has been updated.\n";
       dual_state = best_state.dual_state;
     }
 
@@ -325,8 +337,7 @@ absl::StatusOr<PrimalDualState> SubgradientOptimization(
               << " (best: " << best_state.dual_state.lower_bound()
               << ")\n  Solution cost: " << best_state.solution.cost() << "\n";
   }
-
-  return {std::move(best_state)};
+  return absl::OkStatus();
 }
 
 ///////////////////////////////////////////////////////////////////////
@@ -334,78 +345,155 @@ absl::StatusOr<PrimalDualState> SubgradientOptimization(
 ///////////////////////////////////////////////////////////////////////
 
 namespace {
-void FillTentativeCoreModel(const Model& full_model, Model& core_model) {
-  static constexpr BaseInt kMinCov = 5;
-  core_model = full_model;
-
-  /* columns_map_.clear();
-  columns_map_.reserve(full_model.num_elements() * kMinCov);
-
-  // Select the first min_row_coverage columns for each row
-  const SparseRowView& rows = full_model.rows();
-  for (const SparseRow& row : rows)
-    for (RowEntryIndex n; n < std::min(row.size(), kMinCov); ++n) {
-      columns_map_.push_back(row[n]);
-    }
-  gtl::STLSortAndRemoveDuplicates(&columns_map_);
-  ExtractCoreModel(full_model, columns_map_, *this); */
-}
-
 void ExtractCoreModel(const Model& full_model,
                       const SubsetMapVector& columns_map, Model& core_model) {
   // Fill core model with the selected columns
-  /* const SparseColumnView& full_columns = full_model.columns();
-  const SubsetCostVector& full_costs = full_model.subset_costs();
+  core_model = Model();
   core_model.ReserveNumSubsets(columns_map.size());
-  for (const SubsetIndex full_j : columns_map) {
-    SubsetIndex core_j(core_model.num_subsets());
-    core_model.AddEmptySubset(full_costs[full_j]);
-    for (const ElementIndex i : full_columns[full_j]) {
-      core_model.AddElementToLastSubset(i);
+  for (SubsetIndex core_j : core_model.SubsetRange()) {
+    SubsetIndex full_j = columns_map[core_j];
+    const SparseColumn& full_column = full_model.columns()[full_j];
+    core_model.SetSubsetCost(core_j, full_model.subset_costs()[full_j]);
+    core_model.ReserveNumElementsInSubset(full_column.size(), core_j.value());
+    DCHECK(core_model.columns()[core_j].empty());
+    for (ElementIndex i : full_column) {
+      core_model.AddElementToSubset(i, core_j);
     }
   }
-  core_model.CreateSparseRowView(); */
+  core_model.CreateSparseRowView();
 }
 
-void SelecteMinRedCostColumns(const Model& full_model_,
-                              const DualState& full_dual_state_,
+static constexpr BaseInt kMinCov = 5;
+void FillTentativeCoreModel(const Model& full_model,
+                            SubsetMapVector& columns_map, Model& core_model) {
+  SubsetBoolVector selected(full_model.num_subsets(), false);
+  columns_map.reserve(full_model.num_elements() * kMinCov);
+
+  // Select the first min_row_coverage columns for each row
+  for (const SparseRow& row : full_model.rows()) {
+    BaseInt countdown = kMinCov;
+    for (SubsetIndex j : row) {
+      if (--countdown > 0 && !selected[j]) {
+        selected[j] = true;
+        columns_map.push_back(j);
+      }
+    }
+  }
+  ExtractCoreModel(full_model, columns_map, core_model);
+}
+
+void SelecteMinRedCostColumns(const Model& full_model,
+                              const SubsetCostVector& reduced_costs,
                               SubsetMapVector& columns_map,
                               SubsetBoolVector& selected) {
-  // TODO(cava): implement
+  DCHECK_EQ(reduced_costs.size(), full_model.num_subsets());
+  DCHECK_EQ(selected.size(), full_model.num_subsets());
+  SubsetMapVector candidates;
+  for (SubsetIndex j : full_model.SubsetRange())
+    if (reduced_costs[j] < 0.1) {
+      candidates.push_back(j);
+    }
+
+  BaseInt max_size = 5 * full_model.num_elements();
+  if (candidates.size() > max_size) {
+    absl::c_nth_element(candidates, candidates.begin() + max_size - 1,
+                        [&](SubsetIndex j1, SubsetIndex j2) {
+                          return reduced_costs[j1] < reduced_costs[j2];
+                        });
+    candidates.resize(max_size);
+  }
+  for (SubsetIndex j : candidates) {
+    if (!selected[j]) {
+      selected[j] = true;
+      columns_map.push_back(j);
+    }
+  }
 }
-static void SelectMinRedCostByRow(const Model& full_model_,
-                                  const DualState& full_dual_state_,
+
+static void SelectMinRedCostByRow(const Model& full_model,
+                                  const SubsetCostVector& reduced_costs,
                                   SubsetMapVector& columns_map,
                                   SubsetBoolVector& selected) {
-  // TODO(cava): implement
+  DCHECK_EQ(reduced_costs.size(), full_model.num_subsets());
+  DCHECK_EQ(selected.size(), full_model.num_subsets());
+
+  for (ElementIndex i : full_model.ElementRange()) {
+    // Collect best `kMinCov` columns covering row `i`
+    SubsetIndex best_cols[kMinCov];
+    BaseInt best_size = 0;
+    for (SubsetIndex j : full_model.rows()[i]) {
+      if (best_size < kMinCov) {
+        best_cols[best_size++] = j;
+        continue;
+      }
+      if (reduced_costs[j] < reduced_costs[best_cols[kMinCov - 1]]) {
+        BaseInt n = kMinCov - 1;
+        while (n > 0 && reduced_costs[j] < reduced_costs[best_cols[n - 1]]) {
+          best_cols[n] = best_cols[n - 1];
+          --n;
+        }
+        best_cols[n] = j;
+      }
+    }
+
+    DCHECK(best_size > 0);
+    for (BaseInt s = 0; s < best_size; ++s) {
+      SubsetIndex j = best_cols[s];
+      if (!selected[j]) {
+        selected[j] = true;
+        columns_map.push_back(j);
+      }
+    }
+  }
 }
 }  // namespace
 
 FullToCoreModel::FullToCoreModel(Model&& full_model)
     : CoreModel(),
+      columns_map_(),
       full_model_(std::move(full_model)),
       full_dual_state_(full_model_),
       update_countdown_(10),
       update_period_(10),
       update_max_period_(std::min(1000, full_model_.num_elements() / 3)) {
-  FillTentativeCoreModel(full_model_, static_cast<Model&>(*this));
+  FillTentativeCoreModel(full_model_, columns_map_, static_cast<Model&>(*this));
+  DCHECK_OK(ValidateModel(*this));
 }
 
 bool FullToCoreModel::UpdateCore(PrimalDualState& core_state) {
   if (--update_countdown_ > 0) {
     return false;
   }
-  full_dual_state_.SetMultipliers(*this, core_state.dual_state.multipliers());
 
-  SubsetBoolVector selected(full_model_.num_subsets(), false);
-  SubsetMapVector& columns_map = columns_map_;
-  columns_map.clear();
-  SelecteMinRedCostColumns(full_model_, full_dual_state_, columns_map,
-                           selected);
-  SelectMinRedCostByRow(full_model_, full_dual_state_, columns_map, selected);
-  ExtractCoreModel(full_model_, columns_map, *this);
+  full_dual_state_.SetMultipliers(full_model_,
+                                  core_state.dual_state.multipliers());
   UpdatePricingPeriod(full_dual_state_, core_state);
 
+  SubsetBoolVector selected(full_model_.num_subsets(), false);
+  SubsetMapVector old_column_map = std::move(columns_map_);
+  columns_map_.clear();
+
+  // Always retain best solution in the core model
+  for (SubsetIndex& old_j : core_state.solution.subsets()) {
+    SubsetIndex full_j = old_column_map[old_j];
+    SubsetIndex new_j = SubsetIndex(columns_map_.size());
+    columns_map_.push_back(full_j);
+    selected[full_j] = true;
+    old_j = new_j;
+  }
+
+  SelecteMinRedCostColumns(full_model_, full_dual_state_.reduced_costs(),
+                           columns_map_, selected);
+  SelectMinRedCostByRow(full_model_, full_dual_state_.reduced_costs(),
+                        columns_map_, selected);
+  ExtractCoreModel(full_model_, columns_map_, *this);
+  core_state.dual_state.SetMultipliers(*this, full_dual_state_.multipliers());
+
+  DCHECK_OK(ValidateModel(*this));
+  DCHECK_OK(ValidateFeasibleSolution(*this, core_state.solution));
+  DCHECK_GE(core_state.dual_state.lower_bound(),
+            full_dual_state_.lower_bound());
+  std::cout << "Real bound: " << full_dual_state_.lower_bound() << '\n';
   return true;
 }
 
@@ -614,9 +702,9 @@ class RedundancyRemover {
 
     // Note: In [1], an enumeration to selected the best redundant columns to
     // remove is performed when the number of redundant columns is <= 10.
-    // However, based on experiments with github.com/c4v4/cft/, it appears that
-    // this enumeration does not provide significant benefits to justify the
-    // added complexity.
+    // However, based on experiments with github.com/c4v4/cft/, it appears
+    // that this enumeration does not provide significant benefits to justify
+    // the added complexity.
 
     if (partial_cost_ < cost_cutoff) {
       gtl::STLEraseAllFromSequenceIf(&partial_sol, [&](auto j) {
@@ -679,24 +767,23 @@ class RedundancyRemover {
 
 }  // namespace
 
-absl::Status CompleteGreedySolution(const Model& model, Solution& solution) {
-  return CompleteGreedySolution(model, DualState(model),
-                                std::numeric_limits<Cost>::max(),
-                                std::numeric_limits<BaseInt>::max(), solution);
+void CompleteGreedySolution(const Model& model, Solution& solution) {
+  CompleteGreedySolution(model, DualState(model),
+                         std::numeric_limits<Cost>::max(),
+                         std::numeric_limits<BaseInt>::max(), solution);
 }
 
-absl::Status CompleteGreedySolution(const Model& model,
-                                    const DualState& dual_state,
-                                    Cost cost_cutoff, BaseInt stop_size,
-                                    Solution& solution) {
+void CompleteGreedySolution(const Model& model, const DualState& dual_state,
+                            Cost cost_cutoff, BaseInt stop_size,
+                            Solution& solution) {
   if (solution.cost() >= cost_cutoff) {
     // Solution worse than cutoff -> discard it
     solution.Clear();
-    return absl::OkStatus();
+    return;
   }
   if (solution.subsets().size() >= stop_size) {
     // Solution already has required size -> early exit
-    return absl::OkStatus();
+    return;
   }
 
   // Process input solution (if not empty)
@@ -705,7 +792,7 @@ absl::Status CompleteGreedySolution(const Model& model,
   for (SubsetIndex j : solution.subsets()) {
     num_rows_to_cover -= covered_rows.Cover(model.columns()[j]);
     if (num_rows_to_cover == 0) {
-      return absl::OkStatus();
+      return;
     }
   }
 
@@ -737,8 +824,6 @@ absl::Status CompleteGreedySolution(const Model& model,
       solution.AddSubset(j, model.subset_costs()[j]);
     }
   }
-
-  return absl::OkStatus();
 }
 
 ///////////////////////////////////////////////////////////////////////
@@ -756,15 +841,15 @@ absl::Status RandomizeDualState(DualState& dual_state) {
 }
 }  // namespace
 
-absl::Status HeuristicCBs::RunHeuristic(const SubgradientContext& context,
-                                        Solution& solution) {
+void HeuristicCBs::RunHeuristic(const SubgradientContext& context,
+                                Solution& solution) {
   return CompleteGreedySolution(context.model, context.current_dual_state,
                                 context.best_solution.cost(),
                                 std::numeric_limits<BaseInt>::max(), solution);
 }
 
-absl::Status HeuristicCBs::ComputeMultipliersDelta(
-    const SubgradientContext& context, ElementCostVector& delta_mults) {
+void HeuristicCBs::ComputeMultipliersDelta(const SubgradientContext& context,
+                                           ElementCostVector& delta_mults) {
   Cost squared_norm = .0;
   for (ElementIndex i : context.model.ElementRange()) {
     squared_norm += context.subgradient[i] * context.subgradient[i];
@@ -778,8 +863,6 @@ absl::Status HeuristicCBs::ComputeMultipliersDelta(
   for (ElementIndex i : context.model.ElementRange()) {
     delta_mults[i] = step_constant * context.subgradient[i];
   }
-
-  return absl::OkStatus();
 }
 
 absl::StatusOr<PrimalDualState> RunThreePhase(CoreModel& model,
@@ -790,7 +873,7 @@ absl::StatusOr<PrimalDualState> RunThreePhase(CoreModel& model,
   PrimalDualState best_state = {.solution = init_solution,
                                 .dual_state = DualState(model)};
   if (best_state.solution.Empty()) {
-    RETURN_IF_ERROR(CompleteGreedySolution(model, best_state.solution));
+    CompleteGreedySolution(model, best_state.solution);
   }
   RETURN_IF_ERROR(ValidateFeasibleSolution(model, best_state.solution));
   std::cout << "Initial lower bound: " << best_state.dual_state.lower_bound()
@@ -798,29 +881,26 @@ absl::StatusOr<PrimalDualState> RunThreePhase(CoreModel& model,
             << "\nStarting 3-phase algorithm\n";
 
   PrimalDualState curr_state = best_state;
-  CftSubgradientCBs lower_bound_cbs(model);
+  BoundCBs dual_bound_cbs(model);
   HeuristicCBs heuristic_cbs;
   BaseInt iter_count = 0;
   while (model.num_elements() > 0) {
     ++iter_count;
 
     // Phase 1: refine the current dual_state and model
-    ASSIGN_OR_RETURN(curr_state, SubgradientOptimization(model, lower_bound_cbs,
-                                                         curr_state));
+    RETURN_IF_ERROR(SubgradientOptimization(model, dual_bound_cbs, curr_state));
     if (iter_count == 1) {
       best_state.dual_state = curr_state.dual_state;
+    }
+    // Phase 2: search for good solutions
+    heuristic_cbs.set_step_size(dual_bound_cbs.step_size());
+    RETURN_IF_ERROR(SubgradientOptimization(model, heuristic_cbs, curr_state));
+    if (curr_state.solution.cost() < best_state.solution.cost()) {
+      best_state = curr_state;
     }
     std::cout << "Iterartion " << iter_count
               << "\n - Lower bound: " << curr_state.dual_state.lower_bound()
               << "\n - Solution cost: " << curr_state.solution.cost() << '\n';
-
-    // Phase 2: search for good solutions
-    heuristic_cbs.set_step_size(lower_bound_cbs.step_size());
-    ASSIGN_OR_RETURN(curr_state,
-                     SubgradientOptimization(model, heuristic_cbs, curr_state));
-    if (curr_state.solution.cost() < best_state.solution.cost()) {
-      best_state = curr_state;
-    }
 
     // Phase 3: Fix the best columns (diving)
     RETURN_IF_ERROR(FixBestColumns(model, curr_state));

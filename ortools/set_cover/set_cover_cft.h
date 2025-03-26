@@ -37,6 +37,7 @@ class Solution {
  public:
   double cost() const { return cost_; }
   const std::vector<SubsetIndex>& subsets() const { return subsets_; }
+  std::vector<SubsetIndex>& subsets() { return subsets_; }
   void AddSubset(SubsetIndex subset, Cost cost) {
     subsets_.push_back(subset);
     cost_ += cost;
@@ -118,26 +119,28 @@ struct SubgradientContext {
 class SubgradientCBs {
  public:
   virtual bool ExitCondition(const SubgradientContext&) = 0;
-  virtual absl::Status RunHeuristic(const SubgradientContext&, Solution&) = 0;
-  virtual absl::Status ComputeMultipliersDelta(
-      const SubgradientContext&, ElementCostVector& delta_mults) = 0;
+  virtual void RunHeuristic(const SubgradientContext&, Solution&) = 0;
+  virtual void ComputeMultipliersDelta(const SubgradientContext&,
+                                       ElementCostVector& delta_mults) = 0;
+  virtual bool UpdateCoreModel(CoreModel&, PrimalDualState&) = 0;
   virtual ~SubgradientCBs() = default;
 };
 
-class CftSubgradientCBs : public SubgradientCBs {
+class BoundCBs : public SubgradientCBs {
  public:
   static constexpr Cost kTol = 1e-6;
 
-  CftSubgradientCBs(const Model& model);
+  BoundCBs(const Model& model);
   Cost step_size() const { return step_size_; }
   bool ExitCondition(const SubgradientContext& context) override;
-  absl::Status ComputeMultipliersDelta(const SubgradientContext& context,
-                                       ElementCostVector& delta_mults) override;
-  absl::Status RunHeuristic(const SubgradientContext& context,
-                            Solution& solution) override {
+  void ComputeMultipliersDelta(const SubgradientContext& context,
+                               ElementCostVector& delta_mults) override;
+  void RunHeuristic(const SubgradientContext& context,
+                    Solution& solution) override {
     solution.Clear();
-    return absl::OkStatus();
   }
+  bool UpdateCoreModel(CoreModel& core_model,
+                       PrimalDualState& best_state) override;
 
  private:
   void MakeMinimalCoverageSubgradient(const SubgradientContext& context,
@@ -163,9 +166,8 @@ class CftSubgradientCBs : public SubgradientCBs {
   BaseInt step_size_update_period_;
 };
 
-absl::StatusOr<PrimalDualState> SubgradientOptimization(
-    CoreModel& core_model, SubgradientCBs& cbs,
-    const PrimalDualState& init_state);
+absl::Status SubgradientOptimization(CoreModel& core_model, SubgradientCBs& cbs,
+                                     PrimalDualState& best_state);
 
 ///////////////////////////////////////////////////////////////////////
 //////////////////////// FULL TO CORE PRICING /////////////////////////
@@ -205,11 +207,10 @@ class FullToCoreModel : public CoreModel {
 /////////////////////// MULTIPLIERS BASED GREEDY ///////////////////////
 ////////////////////////////////////////////////////////////////////////
 
-absl::Status CompleteGreedySolution(const Model& model, Solution& solution);
-absl::Status CompleteGreedySolution(const Model& model,
-                                    const DualState& dual_state,
-                                    Cost cost_cutoff, BaseInt size_cutoff,
-                                    Solution& solution);
+void CompleteGreedySolution(const Model& model, Solution& solution);
+void CompleteGreedySolution(const Model& model, const DualState& dual_state,
+                            Cost cost_cutoff, BaseInt size_cutoff,
+                            Solution& solution);
 
 ///////////////////////////////////////////////////////////////////////
 //////////////////////// THREE PHASE ALGORITHM ////////////////////////
@@ -222,10 +223,13 @@ class HeuristicCBs : public SubgradientCBs {
   bool ExitCondition(const SubgradientContext& context) override {
     return --countdown_ <= 0;
   }
-  absl::Status RunHeuristic(const SubgradientContext& context,
-                            Solution& solution) override;
-  absl::Status ComputeMultipliersDelta(const SubgradientContext& context,
-                                       ElementCostVector& delta_mults) override;
+  void RunHeuristic(const SubgradientContext& context,
+                    Solution& solution) override;
+  void ComputeMultipliersDelta(const SubgradientContext& context,
+                               ElementCostVector& delta_mults) override;
+  bool UpdateCoreModel(CoreModel& model, PrimalDualState& state) override {
+    return false;
+  }
 
  private:
   Cost step_size_;
